@@ -1,13 +1,20 @@
+import torch
 from torch import nn
+
+import os
 
 from . import HAMLoss
 from . import NoneOrType
 from collections.abc import Callable
+from typing import Literal
 
 from decimal import Decimal
 
+from tqdm import tqdm
+
 class HAMTrain:
 
+    #MODES = ["causal", "anticausal"]
     MODES = ["causal", "anticausal"]
     SERIALIZATION_DIR = "gradnorms_by_batch/"
 
@@ -28,7 +35,6 @@ class HAMTrain:
                  layers: NoneOrType(list[str]) | NoneOrType(tuple[str]) = None,
                  cpu_gpu_transfer: bool = False,
                  quantifier_fn: Callable[[torch.Tensor], float] = lambda x: x.norm(),
-                 device: torch.device = torch.device("cuda"),
                  variate_names: NoneOrType(list[str] | tuple[str]) = None) -> None:
 
         """
@@ -64,9 +70,14 @@ class HAMTrain:
         self.dataset = dataset_iterator
 
         self.log_folder = log_folder
+        if not os.path.isdir(log_folder):
+            os.makedirs(log_folder)
+
         self.model_name = model_name
         self.horizon_size = horizon_size
+        self.variate_names = variate_names
 
+        self.num_variates = num_variates
         self.variate_indices = variate_indices
         self.layers = layers
 
@@ -87,34 +98,41 @@ class HAMTrain:
                                 for v in variate_indices]
 
         if not layers is None:
-            common_str = os.path.commonprefix(layers)
-            self.filename = lambda x: os.path.join(self.log_folder, "%s%s_%d_gradnorms.txt" % (self.model_name, common_str, self.horizon_size)) \
+            self.filename = lambda x: os.path.join(self.log_folder, "%s%s_%d_gradnorms.txt" % (
+                                        self.model_name, os.path.commonprefix(self.layers), self.horizon_size)) \
                                 if not isinstance(x, int) else \
-                                os.path.join(self.log_folder, "%s%s:%s_%d_gradnorms.txt" % (self.model_name, common_str, variate_names[x], self.horizon_size))
+                                os.path.join(self.log_folder, "%s%s:%s_%d_gradnorms.txt" % (
+                                        self.model_name, os.path.commonprefix(self.layers), self.variate_names[x], self.horizon_size))
         else:
             self.filename = lambda x: os.path.join(self.log_folder, "%s_%d_gradnorms.txt" % (self.model_name, self.horizon_size)) \
                                 if not isinstance(x, int) else \
-                                os.path.join(self.log_folder, "%s:%s_%d_gradnorms.txt" % (self.model_name, variate_names[x], self.horizon_size))
+                                os.path.join(self.log_folder, "%s:%s_%d_gradnorms.txt" % (self.model_name, self.variate_names[x], self.horizon_size))
 
         for mode in self.MODES:
             if os.path.exists(self.filename(mode)):
                 raise FileExistsError("Quantifier files exist for this model: %s!" % self.filename(mode))
 
-        self.layers = layers
-        dims = (len(dataset_iterator), len(layers)) if (num_variates is None or not variate_indices is None) else (len(dataset_iterator), len(layers), len(variate_indices))
+        if num_variates is None:
+            dims = (len(dataset_iterator), len(layers)) 
+        else:
+            if variate_indices is None:
+                dims = (len(dataset_iterator), len(layers), num_variates)
+            else:
+                dims = (len(dataset_iterator), len(layers), len(variate_indices))
 
         if not os.path.isdir(self.SERIALIZATION_DIR):
             os.makedirs(self.SERIALIZATION_DIR)
 
         try:
             self.batch_start = self.deserialize_quantifier_tensor()
+
+        except Exception:
+            self.batch_start = 0
+
             # Keeping dataset's overall tensor in the CPU to enable the same batch sizes as in the training
             self.quantifier_per_timestep = {}
             for mode in self.MODES:
                 self.quantifier_per_timestep[mode] = [torch.zeros(dims) for _ in range(horizon_size+1)]
-
-        except Exception:
-            self.batch_start = 0
 
     def serialize_quantifier_tensor(self, batch_idx: int) -> None:
 
@@ -145,93 +163,96 @@ class HAMTrain:
                 write_str = "Grad norms for subseries %d->%d: " % (start_end[0], start_end[1])
 
                 for idx, layer_name in enumerate(self.model.named_parameters()):
-                    if layer_name in self.layers:
+                    if layer_name[0] in self.layers:
                         if not variate_idx is None:
-                            write_str += "%s=%.16E " % (layer_name, grad_norms_per_timestep[mode][h][:, idx, variate_idx])
+                            write_str += "%s=%.16E " % (layer_name[0], self.quantifier_per_timestep[mode][h][:, idx, variate_idx].mean())
                         else:
-                            write_str += "%s=%.16E " % (layer_name, grad_norms_per_timestep[mode][h][:, idx])
+                            write_str += "%s=%.16E " % (layer_name[0], self.quantifier_per_timestep[mode][h][:, idx].mean())
                 write_str += "\n"
                 f.write(write_str)
 
     def backward(self):
 
         for mode in self.MODES:
+            print (mode)
 
-            for batch_idx, inputs in enumerate(self.dataset):
+            for batch_idx, inputs in enumerate(tqdm(self.dataset)):
 
                 if batch_idx < self.batch_start:
                     continue
 
-                [x.float().to(self.device) for x in inputs]
+                inputs = [x.to(self.device) for x in inputs]
                 input_window, horizon_gt, *metadata = inputs
 
-                horizon_pred = self.model(inputs)
+                horizon_pred = self.model(*inputs)
 
                 for h in range(self.horizon_size + 1):
+                #for h in range(self.horizon_size + 1):
+                    
+                    if h % 50 != 0:
+                        continue
 
                     if any([x in self.model_name for x in self.INTERPOLATION_SUBSERIES_MODELS]):
                         if idx % self.INTERPOLATION_SUBSERIES_LENGTH != 0:
                             continue
 
-                    self.loss_fn.assign_mask(idx, mode)
+                    for loss_idx, loss_fn in enumerate(self.loss_fns):
+                        loss_fn.assign_mask(h, mode)
+                        loss = loss_fn(horizon_pred, horizon_gt)
 
-                    loss = self.loss_fn(horizon_pred, horizon_gt)
+                        # If multivariate or one of the joint distributions of variates
+                        if len(loss.shape) == 0:
 
-                    # If multivariate quantifiers are needed or if a particular distribution of variates is needed
-                    if self.num_variates is None or (not self.num_variates is None and not self.variate_indices is None):
-
-                        loss.backward(retain_graph=True)
-
-                        for idx, (n, param) in enumerate(self.model.named_parameters()):
-                            if not n in self.layers:
-                                continue
-                            if not param.grad is None:
-                                self.quantifier_per_timestep[mode][h][batch_idx][idx] = param.grad.norm()
-
-                        for param in self.model.parameters():
-                            if not param.grad is None:
-                                param.grad.fill_(0)
-
-                    # If independently distributed across variates one by one
-                    else:
-
-                        for v_idx in range(self.variate_indices):
-                            v_loss = loss[v_idx:v_idx+1].mean()
-                            v_loss.backward(retain_graph=True)
+                            loss.backward(retain_graph=True)
 
                             for idx, (n, param) in enumerate(self.model.named_parameters()):
-                                if not n in layer_names:
-                                    print ("CONTINUE")
+                                if not n in self.layers:
                                     continue
                                 if not param.grad is None:
-                                    #grad_norms.append(param.grad.norm())
-                                    grad_norms_per_timestep[mode][h][batch_idx][idx][v_idx] = param.grad.norm()
+                                    if len(self.loss_fns) == 1:
+                                        self.quantifier_per_timestep[mode][h][batch_idx][idx] = param.grad.norm()
+                                    else:
+                                        self.quantifier_per_timestep[mode][h][batch_idx][idx][loss_idx] = param.grad.norm()
 
                             for param in self.model.parameters():
                                 if not param.grad is None:
                                     param.grad.fill_(0)
 
-                        loss = v_loss
+                        # If independently distributed across variates one by one
+                        else:
 
-                save_dict = {"batch": torch.tensor(i), "gradnorms": grad_norms_per_timestep}
-                if not os.path.isdir("gradnorms_temp"):
-                    os.mkdir("gradnorms_temp")
-                torch.save(save_dict, "gradnorms_temp/%s_%d_%s.pth" % (self.args.model, self.args.pred_len, self.args.inspect_backward_pass))
+                            for v_idx in range(self.num_variates):
+                                v_loss = loss[v_idx]
+                                v_loss.backward(retain_graph=True)
+
+                                for idx, (n, param) in enumerate(self.model.named_parameters()):
+                                    if not n in self.layers:
+                                        continue
+                                    if not param.grad is None:
+                                        self.quantifier_per_timestep[mode][h][batch_idx][idx][v_idx] = param.grad.norm()
+
+                                for param in self.model.parameters():
+                                    if not param.grad is None:
+                                        param.grad.fill_(0)
+
+                            loss = v_loss
+
+                self.serialize_quantifier_tensor(batch_idx)
 
                 loss.backward(retain_graph=False)
 
                 # No optim.step() between batches with detach()
                 for param in self.model.parameters():
                     if not param.grad is None:
-                        param.grad.detach()
+                        param.grad.fill_(0).detach()
 
         # Save gradient quantifier to corresponding files!
         for mode in self.MODES:
-            [x.cpu().numpy() for x in grad_norms_per_timestep[mode]]
-            if len(grad_norms_per_timestep[mode][0]) == 3:
-                for v_idx in range(len(self.variate_names)):
+            self.quantifier_per_timestep[mode] = [x.cpu().numpy() for x in self.quantifier_per_timestep[mode]]
+            if len(self.quantifier_per_timestep[mode][0].shape) == 3:
+                for v_idx in range(self.quantifier_per_timestep[mode][0].shape[-1]):
                     fname = self.filename(v_idx)
                     self.write_log_file(fname, mode, v_idx)
-           else:
+            else:
                 fname = self.filename(None)
                 self.write_log_file(fname, mode)
