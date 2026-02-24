@@ -62,7 +62,7 @@ class HAMLoss(nn.Module):
 
         if not cpu_gpu_transfer:
             self.indices_tensors = [None] + [torch.tensor(range(0, h)).long().to(device) for h in range(1, horizon_size+1)]
-            self.indices_tensors_rev = [torch.tensor(range(h, horizon_size)).long().to(device) for h in range(0, horizon_size)] + [None]
+            self.indices_tensors_rev = [torch.tensor(range(h, horizon_size)).long().to(device) for h in range(1, horizon_size+1)] + [None]
         else:
             self.device = device
 
@@ -70,7 +70,7 @@ class HAMLoss(nn.Module):
 
     def assign_mask(self, timestep: int, mode: Literal["causal", "anticausal"]) -> None:
         
-        if timestep == 0 and mode == "causal" or timestep == self.horizon_size and mode == "anticausal":
+        if (timestep == 0 and mode == "causal") or (timestep == self.horizon_size and mode == "anticausal"):
             self.working_mask.fill_(0)
         else:
             self.working_mask.copy_(self.mask)
@@ -201,7 +201,7 @@ class HAMLoss(nn.Module):
             ae = torch.einsum("...vh,...hvw->...hw", ae, self.working_mask)
             loss = ae.mean(dim=0)
         else:
-            ae = ae * self.working_mask
+            ae = ae * self.working_mask.transpose(-2, -1)
             loss = ae.mean()
 
         return loss

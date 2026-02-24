@@ -162,12 +162,12 @@ class HAMTrain:
                 start_end = (0, h) if mode == "causal" else (h, self.horizon_size)
                 write_str = "Grad norms for subseries %d->%d: " % (start_end[0], start_end[1])
 
-                for idx, layer_name in enumerate(self.model.named_parameters()):
-                    if layer_name[0] in self.layers:
+                for idx, layer in enumerate(self.model.named_parameters()):
+                    if layer[0] in self.layers:
                         if not variate_idx is None:
-                            write_str += "%s=%.16E " % (layer_name[0], self.quantifier_per_timestep[mode][h][:, idx, variate_idx].mean())
+                            write_str += "%s=%.16E " % (layer[0], self.quantifier_per_timestep[mode][h][:, idx, variate_idx].mean())
                         else:
-                            write_str += "%s=%.16E " % (layer_name[0], self.quantifier_per_timestep[mode][h][:, idx].mean())
+                            write_str += "%s=%.16E " % (layer[0], self.quantifier_per_timestep[mode][h][:, idx].mean())
                 write_str += "\n"
                 f.write(write_str)
 
@@ -187,10 +187,10 @@ class HAMTrain:
                 horizon_pred = self.model(*inputs)
 
                 for h in range(self.horizon_size + 1):
-                #for h in range(self.horizon_size + 1):
-                    
-                    if h % 50 != 0:
-                        continue
+
+                    for param in self.model.parameters():
+                        if not param.grad is None:
+                            param.grad.fill_(0)
 
                     if any([x in self.model_name for x in self.INTERPOLATION_SUBSERIES_MODELS]):
                         if idx % self.INTERPOLATION_SUBSERIES_LENGTH != 0:
@@ -214,15 +214,16 @@ class HAMTrain:
                                     else:
                                         self.quantifier_per_timestep[mode][h][batch_idx][idx][loss_idx] = param.grad.norm()
 
-                            for param in self.model.parameters():
-                                if not param.grad is None:
-                                    param.grad.fill_(0)
+                            if len(self.loss_fns) > 1:
+                                for param in self.model.parameters():
+                                    if not param.grad is None:
+                                        param.grad.fill_(0)
 
                         # If independently distributed across variates one by one
                         else:
 
                             for v_idx in range(self.num_variates):
-                                v_loss = loss[v_idx]
+                                v_loss = loss[v_idx:v_idx+1].mean()
                                 v_loss.backward(retain_graph=True)
 
                                 for idx, (n, param) in enumerate(self.model.named_parameters()):
@@ -244,7 +245,7 @@ class HAMTrain:
                 # No optim.step() between batches with detach()
                 for param in self.model.parameters():
                     if not param.grad is None:
-                        param.grad.fill_(0).detach()
+                        param.grad.detach()
 
         # Save gradient quantifier to corresponding files!
         for mode in self.MODES:
